@@ -6,6 +6,8 @@ import onnx
 from onnx import numpy_helper
 from ..utils import face_align
 
+import os
+
 try:
     profile  # exists when line_profiler is running the script
 except NameError:
@@ -41,13 +43,26 @@ class INSwapper():
         self.input_shape = input_shape
         print('inswapper-shape:', self.input_shape)
         self.input_size = tuple(input_shape[2:4][::-1])
+        self.filters = {}
 
     def forward(self, img, latent):
         img = (img - self.input_mean) / self.input_std
         pred = self.session.run(self.output_names, {self.input_names[0]: img, self.input_names[1]: latent})[0]
         return pred
 
-#    @profile
+    def __write_img(self, img, name):
+        file_name = os.path.join('output', name)
+        cv2.imwrite(file_name, img.astype(np.uint8))
+
+    def __get_gaussain_filter(self, ksize):
+        if ksize in self.filters:
+            return self.filters[ksize]
+        sigma = 0.3*((ksize-1)*0.5 - 1) + 0.8
+        self.filters[ksize] = cv2.cuda.createGaussianFilter(cv2.CV_8UC1, cv2.CV_8UC1, (ksize,ksize), ksize*2)
+        return self.filters[ksize]
+        
+
+    @profile
     def get(self, img, target_face, source_face, paste_back=True):
         aimg, M = face_align.norm_crop2(img, target_face.kps, self.input_size[0])
         blob = cv2.dnn.blobFromImage(aimg, 1.0 / self.input_std, self.input_size,
@@ -65,9 +80,24 @@ class INSwapper():
         else:
             target_img = img
             IM = cv2.invertAffineTransform(M)
-            img_white = np.full((aimg.shape[0],aimg.shape[1]), 255, dtype=np.float32)
+            x, y = aimg.shape[:2] #aimg.shape[0], aimg.shape[1]
+            center = (x // 2, y // 2)
+            x_resized = int(x * .9)
+            y_resized = int(y * .9)
+
+            # To center `img_white`, you should calculate the top-left corner of the resized image
+            top_left_x = center[1] - x_resized // 2
+            top_left_y = center[0] - y_resized // 2          
+
+            img_white = np.full((x_resized,y_resized), 255, dtype=np.float32)
+
+            # Then create a new image where `img_white` is centered
+            black_background_with_white_center  = np.full((x, y), 0, dtype=np.float32) 
+            img_white_resized = np.full((x_resized, y_resized), 255, dtype=np.float32)  # Your resized white image
+            black_background_with_white_center[top_left_y:top_left_y+x_resized, top_left_x:top_left_x+y_resized] = img_white_resized
+
+            img_white = cv2.warpAffine(black_background_with_white_center, IM, (target_img.shape[1], target_img.shape[0]), borderValue=0.0)
             bgr_fake = cv2.warpAffine(bgr_fake, IM, (target_img.shape[1], target_img.shape[0]), borderValue=0.0)
-            img_white = cv2.warpAffine(img_white, IM, (target_img.shape[1], target_img.shape[0]), borderValue=0.0)
             img_white[img_white>20] = 255
 
             img_mask = img_white
@@ -75,33 +105,32 @@ class INSwapper():
             mask_h = np.max(mask_h_inds) - np.min(mask_h_inds)
             mask_w = np.max(mask_w_inds) - np.min(mask_w_inds)
             mask_size = int(np.sqrt(mask_h*mask_w))
-            k = max(mask_size//10, 10)
 
-            kernel = np.ones((k,k),np.uint8)
-
-            img_mask = cv2.erode(img_mask,kernel,iterations = 1)
-
-            kernel = np.ones((2,2),np.uint8)
-
-            k = max(mask_size//20, 5) 
-            kernel_size = tuple(min(2*k+1, 31) for i in range(2)) # CUDA only supports kernel size up to 31
-            # TODO - Test blur size for large images against CPU baseline
-            blur_size = tuple(2*k+1 for i in kernel_size) 
-            if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+            if cv2.cuda.getCudaEnabledDeviceCount() > 1:
                 bgr_fake_gpu = cv2.cuda_GpuMat()
                 bgr_fake_gpu.upload(bgr_fake)
 
                 target_img_gpu = cv2.cuda_GpuMat()
                 target_img_gpu.upload(target_img)
 
-                # Upload image mask as an alpha channel and blur
+                # Upload image mask as an alpha channel
                 alpha_channel_gpu = cv2.cuda_GpuMat()
                 alpha_channel_gpu.upload(img_mask.astype(np.uint8))
-                gpu_blur = cv2.cuda.createGaussianFilter(alpha_channel_gpu.type(), -1, kernel_size, blur_size[0])
-                alpha_channel_gpu = gpu_blur.apply(alpha_channel_gpu)
+
+                # Set kernel size and iterations for GPU filter options
+                k = max(mask_size//10, 10)
+                if k % 2 == 0: # Ensure kernel size is odd
+                    k += 1
+                k = min(k, 31) # Ensure kernel size is <= 61 on GPU
+                iterations = mask_size // 10 // k + 1# Apply iterations to make up for smaller kernel size vs. CPU
+                
+                # Blur edges of alpha channel, so source and target blend     
+                gpu_blur = self.__get_gaussain_filter(k)
+                for _ in range(iterations):
+                    gpu_blur.apply(alpha_channel_gpu, alpha_channel_gpu)
 
                 # Create inverse alpha channel for blending background image
-                scaler_gpu = cv2.cuda_GpuMat(alpha_channel_gpu.size(), alpha_channel_gpu.type())
+                scaler_gpu = cv2.cuda_GpuMat(alpha_channel_gpu.size(), cv2.CV_8UC1)
                 scaler_gpu.setTo(255)
                 inverse_alpha_channel_gpu = cv2.cuda.subtract(scaler_gpu, alpha_channel_gpu)
 
@@ -121,6 +150,9 @@ class INSwapper():
                 fake_merged = cv2.cuda.merge([fake_merged_channels[0], fake_merged_channels[1], fake_merged_channels[2]])
                 return fake_merged
             else:
+                k = max(mask_size//20, 5) 
+                kernel_size = (k, k)
+                blur_size = tuple(2*k+1 for i in kernel_size)
                 img_mask = cv2.GaussianBlur(img_mask, blur_size, 0)
                 img_mask /= 255
                 img_mask = np.reshape(img_mask, [img_mask.shape[0],img_mask.shape[1],1])
