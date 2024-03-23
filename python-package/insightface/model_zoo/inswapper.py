@@ -70,9 +70,7 @@ class INSwapper():
         latent = source_face.normed_embedding.reshape((1,-1))
         latent = np.dot(latent, self.emap)
         latent /= np.linalg.norm(latent)
-        pred = self.session.run(self.output_names, {self.input_names[0]: blob, self.input_names[1]: latent})
-        pred = pred[0]
-
+        pred = self.session.run(self.output_names, {self.input_names[0]: blob, self.input_names[1]: latent})[0]
         img_fake = pred.transpose((0,2,3,1))[0]
         bgr_fake = np.clip(255 * img_fake, 0, 255).astype(np.uint8)[:,:,::-1]
         if not paste_back:
@@ -106,7 +104,7 @@ class INSwapper():
             mask_w = np.max(mask_w_inds) - np.min(mask_w_inds)
             mask_size = int(np.sqrt(mask_h*mask_w))
 
-            if cv2.cuda.getCudaEnabledDeviceCount() > 1:
+            if cv2.cuda.getCudaEnabledDeviceCount() > 0:
                 bgr_fake_gpu = cv2.cuda_GpuMat()
                 bgr_fake_gpu.upload(bgr_fake)
 
@@ -122,7 +120,7 @@ class INSwapper():
                 if k % 2 == 0: # Ensure kernel size is odd
                     k += 1
                 k = min(k, 31) # Ensure kernel size is <= 61 on GPU
-                iterations = mask_size // 10 // k + 1# Apply iterations to make up for smaller kernel size vs. CPU
+                iterations = mask_size // 20 // k + 1# Apply iterations to make up for smaller kernel size vs. CPU
                 
                 # Blur edges of alpha channel, so source and target blend     
                 gpu_blur = self.__get_gaussain_filter(k)
